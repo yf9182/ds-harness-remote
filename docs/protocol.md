@@ -762,7 +762,7 @@ Connection handler。不得通过该入口绕过 Harness Remote allowlist、Remo
 对象或 `null`（数组与原始值拒绝）；额外顶层字段拒绝。Host 在进入任何本机 carrier 前
 按 `endpoint` 执行以下编译期固定操作白名单，新增上游操作默认拒绝：
 
-- 查询：`state`、`models`、`efforts`、`exchange`、`earlier`、`usage`、`room-progress`、`schedules`。
+- 查询：`state`、`models`、`efforts`、`exchange`、`earlier`、`chat`、`usage`、`room-progress`、`schedules`、`update-check`。
 - Bot 管理：`create-bot`、`duplicate-bot`、`update-bot`、`delete-bot`、`set-main`、`set-flags`。
 - 群聊管理：`create-room`、`update-room`、`delete-room`。
 - Agent 会话管理：`add-agent`、`agent-session`、`agent-adopt`、`agent-archive`、`agent-rename`、`remove-agent`。
@@ -773,6 +773,8 @@ Connection handler。不得通过该入口绕过 Harness Remote allowlist、Remo
 handler 校验；Remote 保留既有认证、消息大小与超时边界，不重放提交。
 
 `approval-answer` 只接受 DS Bot 的 `allow`（单次）或 `reject`，不开放 session-wide 审批。
+`chat` 返回指定 Bot 私聊当页（含当前段），`earlier` 只翻旧段，两者 cursor 形状一致；
+`update-check` 只做版本检查，不安装（`update-install`、`dsh-update-install` 仍拒绝）。
 安装/升级、日程增删、凭据和 connector 管理、能力脚本、memory 写入、浏览器控制、诊断
 文件及本机偏好设置等操作均不开放；不允许通过 `api/bot` 间接扩大 Harness Remote 权限。
 被拒绝的操作返回 `INVALID_MESSAGE`，浏览器兼容入口显示安全的

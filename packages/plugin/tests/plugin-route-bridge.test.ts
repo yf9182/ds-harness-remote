@@ -39,7 +39,7 @@ describe('PluginRouteBridge', () => {
 
   it('admits reviewed Bot operations and refuses local administration before dispatch', async () => {
     await runScenarios([
-      ...['state', 'send', 'create-bot', 'update-room', 'agent-session', 'schedules'].map(endpoint => ({
+      ...['state', 'send', 'create-bot', 'update-room', 'agent-session', 'schedules', 'chat', 'update-check'].map(endpoint => ({
         name: `admit ${endpoint}`, body: { endpoint, payload: {} }, allowed: true,
       })),
       { name: 'one-time approval', body: { endpoint: 'approval-answer', payload: { choice: 'allow' } }, allowed: true },

@@ -22990,9 +22990,11 @@ var BOT_REMOTE_OPERATIONS = [
   "efforts",
   "exchange",
   "earlier",
+  "chat",
   "usage",
   "room-progress",
   "schedules",
+  "update-check",
   "create-bot",
   "duplicate-bot",
   "update-bot",
@@ -27431,7 +27433,7 @@ function normalizeServerUrl(value) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.19-ios-mvp.2";
+var PLUGIN_VERSION = "0.5.19-ios-full.0";
 
 // src/server-api.ts
 var TERMINAL_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -41036,6 +41038,111 @@ var dsBotDismissQuestionPayloadSchema = external_exports.object({
 var dsBotRoomProgressPayloadSchema = external_exports.object({
   roomId: external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0)
 }).strict();
+var dsBotIdSchema = external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0);
+var dsBotOptionalTextSchema = external_exports.string().max(12e3);
+var dsBotMemberIdsSchema = external_exports.array(dsBotIdSchema).max(64);
+var dsBotCreateBotPayloadSchema = external_exports.object({
+  name: external_exports.string().trim().min(1).max(200),
+  role: external_exports.string().max(4e3).optional(),
+  color: external_exports.string().max(64).optional(),
+  instructions: dsBotOptionalTextSchema.optional(),
+  brief: external_exports.string().max(4e3).optional(),
+  model: external_exports.string().max(256).nullable().optional(),
+  effort: external_exports.string().max(128).optional(),
+  workDir: external_exports.string().max(4096).optional()
+}).strict();
+var dsBotUpdateBotPayloadSchema = external_exports.object({
+  id: dsBotIdSchema,
+  name: external_exports.string().trim().min(1).max(200).optional(),
+  role: external_exports.string().max(4e3).optional(),
+  color: external_exports.string().max(64).optional(),
+  instructions: dsBotOptionalTextSchema.optional(),
+  brief: external_exports.string().max(4e3).optional(),
+  model: external_exports.string().max(256).nullable().optional(),
+  effort: external_exports.string().max(128).optional(),
+  workDir: external_exports.string().max(4096).optional()
+}).strict();
+var dsBotCreateRoomPayloadSchema = external_exports.object({
+  name: external_exports.string().trim().min(1).max(200),
+  members: dsBotMemberIdsSchema.min(2),
+  admin: dsBotIdSchema.optional(),
+  greet: external_exports.boolean().optional()
+}).strict();
+var dsBotUpdateRoomPayloadSchema = external_exports.object({
+  id: dsBotIdSchema,
+  name: external_exports.string().trim().min(1).max(200).optional(),
+  notice: external_exports.string().max(12e3).optional(),
+  mode: external_exports.string().max(64).optional(),
+  admin: dsBotIdSchema.optional(),
+  members: dsBotMemberIdsSchema.optional(),
+  add: dsBotMemberIdsSchema.optional(),
+  remove: dsBotMemberIdsSchema.optional(),
+  workDir: external_exports.string().max(4096).optional(),
+  permission: external_exports.string().max(128).optional(),
+  relayLimit: external_exports.number().int().min(0).max(100).optional()
+}).strict();
+var dsBotDeletePayloadSchema = external_exports.object({ id: dsBotIdSchema }).strict();
+var dsBotSetMainPayloadSchema = external_exports.object({
+  id: dsBotIdSchema,
+  main: external_exports.boolean().optional(),
+  primary: external_exports.boolean().optional(),
+  replace: dsBotIdSchema.optional()
+}).strict();
+var dsBotSetFlagsPayloadSchema = external_exports.object({
+  id: dsBotIdSchema,
+  pinned: external_exports.boolean().optional(),
+  archived: external_exports.boolean().optional(),
+  hidden: external_exports.boolean().optional()
+}).strict();
+var dsBotStopMemberPayloadSchema = external_exports.object({ roomId: dsBotIdSchema, botId: dsBotIdSchema }).strict();
+var dsBotDuplicatePayloadSchema = external_exports.object({ id: dsBotIdSchema }).strict();
+var dsBotSendPayloadSchema = external_exports.object({
+  sessionId: dsBotIdSchema,
+  text: external_exports.string().trim().min(1).max(32e3)
+}).strict();
+var dsBotViewReplyPayloadSchema = external_exports.object({
+  sessionId: dsBotIdSchema,
+  viewId: dsBotIdSchema,
+  action: external_exports.string().min(1).max(128),
+  values: external_exports.record(external_exports.unknown()).optional()
+}).strict();
+var dsBotSimpleReadPayloadSchemas = {
+  hello: external_exports.object({ api: external_exports.array(external_exports.number().int().min(1).max(64)).max(16).optional() }).strict(),
+  state: external_exports.object({
+    locale: external_exports.string().max(64).optional(),
+    since: external_exports.number().int().nonnegative().optional(),
+    models: external_exports.string().max(16384).optional(),
+    avatars: external_exports.enum(["ref"]).optional()
+  }).strict(),
+  notices: external_exports.object({ boot: external_exports.string().max(256).optional(), since: external_exports.number().int().nonnegative().optional() }).strict(),
+  avatar: external_exports.object({ botId: dsBotIdSchema }).strict(),
+  chat: external_exports.object({ botId: dsBotIdSchema, cursor: external_exports.object({ part: external_exports.number().int().nonnegative().optional(), beforeSeq: external_exports.number().int().nonnegative().optional() }).strict().optional() }).strict(),
+  "room-chat": external_exports.object({ roomId: dsBotIdSchema, cursor: external_exports.object({ beforeSeq: external_exports.number().int().nonnegative() }).strict().optional() }).strict(),
+  "room-progress": dsBotRoomProgressPayloadSchema,
+  "usage-summary": external_exports.object({ botId: dsBotIdSchema, timeZone: external_exports.string().max(64).optional() }).strict(),
+  "run-stats": external_exports.object({ botId: dsBotIdSchema }).strict(),
+  models: external_exports.object({}).strict(),
+  efforts: external_exports.object({ ref: external_exports.string().max(256) }).strict(),
+  earlier: external_exports.object({ sessionId: dsBotIdSchema, cursor: external_exports.object({ part: external_exports.number().int().nonnegative().optional(), beforeSeq: external_exports.number().int().nonnegative().optional() }).strict().optional() }).strict(),
+  exchange: external_exports.object({ a: dsBotIdSchema, b: dsBotIdSchema }).strict(),
+  usage: external_exports.object({ timeZone: external_exports.string().max(64).optional() }).strict(),
+  schedules: external_exports.object({ botId: dsBotIdSchema.optional(), roomId: dsBotIdSchema.optional() }).strict(),
+  "create-bot": dsBotCreateBotPayloadSchema,
+  "duplicate-bot": dsBotDuplicatePayloadSchema,
+  "update-bot": dsBotUpdateBotPayloadSchema,
+  "delete-bot": dsBotDeletePayloadSchema,
+  "set-main": dsBotSetMainPayloadSchema,
+  "set-flags": dsBotSetFlagsPayloadSchema,
+  "create-room": dsBotCreateRoomPayloadSchema,
+  "update-room": dsBotUpdateRoomPayloadSchema,
+  "delete-room": dsBotDeletePayloadSchema,
+  "stop-member-work": dsBotStopMemberPayloadSchema,
+  send: dsBotSendPayloadSchema,
+  "view-reply": dsBotViewReplyPayloadSchema,
+  "answer-question": dsBotAnswerQuestionPayloadSchema,
+  "dismiss-question": dsBotDismissQuestionPayloadSchema,
+  "approval-answer": dsBotApprovalAnswerPayloadSchema
+};
 var dsBotFeedPayloadSchema = external_exports.object({ args: external_exports.object({}).strict() }).strict();
 var commandExecuteArgsSchema = external_exports.object({
   agentId: external_exports.string().min(1).max(128),
@@ -41079,11 +41186,29 @@ var INLINE_TRANSFER_RESPONSE_BYTES4 = 2 * 1024 * 1024;
 var DS_BOT_MOBILE_CALL_ENDPOINTS = /* @__PURE__ */ new Set([
   "hello",
   "state",
+  "models",
+  "efforts",
+  "earlier",
+  "exchange",
+  "usage",
+  "run-stats",
+  "schedules",
   "chat",
   "room-chat",
   "avatar",
   "notices",
   "send",
+  "create-bot",
+  "duplicate-bot",
+  "update-bot",
+  "delete-bot",
+  "set-main",
+  "set-flags",
+  "create-room",
+  "update-room",
+  "delete-room",
+  "stop-member-work",
+  "view-reply",
   "answer-question",
   "dismiss-question",
   "approval-answer",
@@ -41441,17 +41566,9 @@ var HarnessRemoteBridge = class {
     if (!DS_BOT_MOBILE_CALL_ENDPOINTS.has(parsed.data.args.endpoint)) {
       throw new RpcError("METHOD_NOT_ALLOWED", "The requested DS Bot mobile endpoint is not allowed.");
     }
-    if (parsed.data.args.endpoint === "answer-question" && !dsBotAnswerQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot question answer.");
-    }
-    if (parsed.data.args.endpoint === "approval-answer" && !dsBotApprovalAnswerPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot approval answer.");
-    }
-    if (parsed.data.args.endpoint === "dismiss-question" && !dsBotDismissQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot question dismissal.");
-    }
-    if (parsed.data.args.endpoint === "room-progress" && !dsBotRoomProgressPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot room progress request.");
+    const schema = dsBotSimpleReadPayloadSchemas[parsed.data.args.endpoint];
+    if (schema === void 0 || !schema.safeParse(parsed.data.args.payload ?? {}).success) {
+      throw new RpcError("INVALID_MESSAGE", `Invalid DS Bot ${parsed.data.args.endpoint} request.`);
     }
   }
   assertDsBotFeedPayload(payload) {
