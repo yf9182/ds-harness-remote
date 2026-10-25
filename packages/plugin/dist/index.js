@@ -27431,7 +27431,7 @@ function normalizeServerUrl(value) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.18";
+var PLUGIN_VERSION = "0.5.19-ios-mvp.2";
 
 // src/server-api.ts
 var TERMINAL_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -41014,6 +41014,29 @@ var streamOpenSchema4 = external_exports.object({
   payload: external_exports.unknown()
 }).strict();
 var streamCloseSchema4 = external_exports.object({ streamId: external_exports.string().min(1).max(128) }).strict();
+var dsBotCallPayloadSchema = external_exports.object({ args: external_exports.object({
+  endpoint: external_exports.string().min(1).max(128),
+  payload: external_exports.record(external_exports.unknown()).nullable().optional()
+}).strict() }).strict();
+var dsBotAnswerQuestionPayloadSchema = external_exports.object({
+  sessionId: external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0),
+  questionId: external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0),
+  answer: external_exports.object({
+    selected: external_exports.array(external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0)).max(6),
+    custom: external_exports.string().min(1).max(8e3).refine((value) => value.trim().length > 0).optional()
+  }).strict()
+}).strict();
+var dsBotApprovalAnswerPayloadSchema = external_exports.object({
+  id: external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0),
+  choice: external_exports.enum(["allow", "reject"])
+}).strict();
+var dsBotDismissQuestionPayloadSchema = external_exports.object({
+  sessionId: external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0)
+}).strict();
+var dsBotRoomProgressPayloadSchema = external_exports.object({
+  roomId: external_exports.string().min(1).max(256).refine((value) => value.trim().length > 0)
+}).strict();
+var dsBotFeedPayloadSchema = external_exports.object({ args: external_exports.object({}).strict() }).strict();
 var commandExecuteArgsSchema = external_exports.object({
   agentId: external_exports.string().min(1).max(128),
   line: external_exports.string().min(1).max(2048),
@@ -41053,6 +41076,19 @@ var directoryListSchema2 = external_exports.object({
 var MAX_ACTIVE_STREAMS3 = MAX_ALPHA_STREAMS_PER_CONNECTION;
 var MAX_ACTIVE_TRANSFERS3 = MAX_ACTIVE_TRANSFERS_PER_DIRECTION;
 var INLINE_TRANSFER_RESPONSE_BYTES4 = 2 * 1024 * 1024;
+var DS_BOT_MOBILE_CALL_ENDPOINTS = /* @__PURE__ */ new Set([
+  "hello",
+  "state",
+  "chat",
+  "room-chat",
+  "avatar",
+  "notices",
+  "send",
+  "answer-question",
+  "dismiss-question",
+  "approval-answer",
+  "room-progress"
+]);
 var HARNESS_REMOTE_ALLOWLIST = [
   "$events",
   "$events/result",
@@ -41065,6 +41101,8 @@ var HARNESS_REMOTE_ALLOWLIST = [
   "credentials/set",
   "credentials/unset",
   "directoryPicker/list",
+  "dsBot/call",
+  "dsBot/feed",
   "fileReferences/list",
   "goals/clear",
   "goals/complete",
@@ -41163,6 +41201,8 @@ var HarnessRemoteBridge = class {
   async call(input3) {
     const params = callSchema4.parse(input3);
     this.assertAllowed(params.endpoint);
+    if (params.endpoint === "dsBot/feed") throw new RpcError("METHOD_NOT_ALLOWED", "Use a stream for this DS Bot endpoint.");
+    if (params.endpoint === "dsBot/call") this.assertDsBotCallPayload(params.payload);
     if (TERMINAL_STREAMS.has(params.endpoint)) throw new RpcError("METHOD_NOT_ALLOWED", "Use a stream for this terminal endpoint.");
     if (["settings/update", "settings/replace", "settings/mutate"].includes(params.endpoint)) {
       const args = requestArgs(params.payload);
@@ -41335,6 +41375,8 @@ var HarnessRemoteBridge = class {
   async openStream(input3) {
     const params = streamOpenSchema4.parse(input3);
     this.assertAllowed(params.endpoint);
+    if (params.endpoint === "dsBot/call") throw new RpcError("METHOD_NOT_ALLOWED", "This DS Bot endpoint is unary.");
+    if (params.endpoint === "dsBot/feed") this.assertDsBotFeedPayload(params.payload);
     if (params.endpoint.startsWith("pluginManager/")) throw new RpcError("METHOD_NOT_ALLOWED", "Plugin management endpoints are not streams.");
     if (params.endpoint.startsWith("settings/")) throw new RpcError("METHOD_NOT_ALLOWED", "Settings endpoints are not streams.");
     if (TERMINAL_CALLS.has(params.endpoint)) throw new RpcError("METHOD_NOT_ALLOWED", "This terminal endpoint is not a stream.");
@@ -41391,6 +41433,30 @@ var HarnessRemoteBridge = class {
     const remoteModule = (value) => typeof value === "string" && /^(?:ds-harness-remote|dsh-remote)(?:\/|$)/.test(value);
     if (remoteModule(plugin ? row.moduleName : row.name) || !plugin && (!Array.isArray(row.rows) || row.rows.some((value) => !isRecord21(value) || remoteModule(value.moduleName)) || Array.isArray(row.overrides) && row.overrides.some((value) => remoteModule(value) || value === "ds-harness-remote-tui"))) {
       throw new RpcError("PERMISSION_DENIED", "The Remote plugin can only be enabled or disabled locally on the Host.");
+    }
+  }
+  assertDsBotCallPayload(payload) {
+    const parsed = dsBotCallPayloadSchema.safeParse(payload);
+    if (!parsed.success) throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot Remote call.");
+    if (!DS_BOT_MOBILE_CALL_ENDPOINTS.has(parsed.data.args.endpoint)) {
+      throw new RpcError("METHOD_NOT_ALLOWED", "The requested DS Bot mobile endpoint is not allowed.");
+    }
+    if (parsed.data.args.endpoint === "answer-question" && !dsBotAnswerQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot question answer.");
+    }
+    if (parsed.data.args.endpoint === "approval-answer" && !dsBotApprovalAnswerPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot approval answer.");
+    }
+    if (parsed.data.args.endpoint === "dismiss-question" && !dsBotDismissQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot question dismissal.");
+    }
+    if (parsed.data.args.endpoint === "room-progress" && !dsBotRoomProgressPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot room progress request.");
+    }
+  }
+  assertDsBotFeedPayload(payload) {
+    if (!dsBotFeedPayloadSchema.safeParse(payload).success) {
+      throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot Remote feed request.");
     }
   }
   assertAllowed(endpoint) {

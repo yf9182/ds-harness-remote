@@ -85,6 +85,143 @@ describe('HarnessRemoteBridge', () => {
     }
   })
 
+  it('forwards only the fixed DS Bot MVP call endpoints', async () => {
+    const endpoints = ['hello', 'state', 'chat', 'room-chat', 'avatar', 'notices', 'send', 'dismiss-question']
+    await runScenarios(endpoints.map(endpoint => ({
+      name: endpoint,
+      run: async () => {
+        const dispatch = vi.fn(async () => ({ ok: true as const, value: { endpoint } }))
+        const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+        const payload = { args: { endpoint, payload: { sessionId: 'session-1' } } }
+        await expect(bridge.call({ endpoint: 'dsBot/call', payload })).resolves.toEqual({ ok: true, value: { endpoint } })
+        expect(dispatch).toHaveBeenCalledWith('dsBot/call', payload, expect.any(AbortSignal))
+        expect(dispatch).toHaveBeenCalledTimes(1)
+      },
+    })))
+  })
+
+  it('forwards only bounded question answers and one-time approval decisions', async () => {
+    await runScenarios([
+      {
+        name: 'answer-question',
+        endpoint: 'answer-question',
+        payload: { sessionId: 'session-1', questionId: 'question-1', answer: { selected: ['Option A', 'Option B'], custom: 'Additional context' } },
+      },
+      {
+        name: 'approval-answer allow',
+        endpoint: 'approval-answer',
+        payload: { id: 'approval-1', choice: 'allow' },
+      },
+      {
+        name: 'approval-answer reject',
+        endpoint: 'approval-answer',
+        payload: { id: 'approval-1', choice: 'reject' },
+      },
+      {
+        name: 'dismiss-question',
+        endpoint: 'dismiss-question',
+        payload: { sessionId: 'session-1' },
+      },
+    ].map(({ name, endpoint, payload }) => ({
+      name,
+      run: async () => {
+        const dispatch = vi.fn(async () => ({ ok: true as const, value: true }))
+        const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+        const request = { args: { endpoint, payload } }
+        await expect(bridge.call({ endpoint: 'dsBot/call', payload: request })).resolves.toEqual({ ok: true, value: true })
+        expect(dispatch).toHaveBeenCalledWith('dsBot/call', request, expect.any(AbortSignal))
+        expect(dispatch).toHaveBeenCalledTimes(1)
+      },
+    })))
+  })
+
+  it('rejects malformed or expanded DS Bot question and approval payloads before dispatch', async () => {
+    const dispatch = vi.fn(async () => ({ ok: true as const }))
+    const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+    const invalid = [
+      { name: 'question missing identity', endpoint: 'answer-question', payload: { questionId: 'q1', answer: { selected: ['A'] } } },
+      { name: 'question identity too long', endpoint: 'answer-question', payload: { sessionId: 's'.repeat(257), questionId: 'q1', answer: { selected: ['A'] } } },
+      { name: 'question selection too large', endpoint: 'answer-question', payload: { sessionId: 's1', questionId: 'q1', answer: { selected: Array.from({ length: 7 }, (_, i) => `Option ${i}`) } } },
+      { name: 'question answer nested structure', endpoint: 'answer-question', payload: { sessionId: 's1', questionId: 'q1', answer: { selected: ['A'], extra: { command: 'x' } } } },
+      { name: 'question selection contains object', endpoint: 'answer-question', payload: { sessionId: 's1', questionId: 'q1', answer: { selected: [{ label: 'A' }] } } },
+      { name: 'question custom answer too large', endpoint: 'answer-question', payload: { sessionId: 's1', questionId: 'q1', answer: { selected: [], custom: 'x'.repeat(8_001) } } },
+      { name: 'question extra top-level field', endpoint: 'answer-question', payload: { sessionId: 's1', questionId: 'q1', answer: { selected: ['A'] }, method: 'unexpected' } },
+      { name: 'approval choice outside enum', endpoint: 'approval-answer', payload: { id: 'approval-1', choice: 'allow_session' } },
+      { name: 'approval extra field', endpoint: 'approval-answer', payload: { id: 'approval-1', choice: 'allow', token: 'unexpected' } },
+      { name: 'approval identity too long', endpoint: 'approval-answer', payload: { id: 'a'.repeat(257), choice: 'reject' } },
+      { name: 'question dismissal missing session', endpoint: 'dismiss-question', payload: {} },
+      { name: 'question dismissal extra field', endpoint: 'dismiss-question', payload: { sessionId: 's1', questionId: 'q1' } },
+    ]
+
+    await runScenarios(invalid.map(({ name, endpoint, payload }) => ({
+      name,
+      run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint, payload } } }))
+        .rejects.toMatchObject({ code: 'INVALID_MESSAGE' }),
+    })))
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('rejects DS Bot calls outside the MVP endpoint allowlist and prevents direction or argument bypasses', async () => {
+    const dispatch = vi.fn(async () => ({ ok: true as const }))
+    const open = vi.fn(async () => (async function* () { yield { event: 'hello' } })())
+    const bridge = new HarnessRemoteBridge(gateway({ dispatch, open }), vi.fn())
+
+    await runScenarios([
+      ...['providers', 'provider-key', 'capability-approve', 'memory-edit', 'usage-summary', 'view-reply', 'unknown'].map(endpoint => ({
+        name: `inner endpoint ${endpoint}`,
+        run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint, payload: {} } } }))
+          .rejects.toMatchObject({ code: 'METHOD_NOT_ALLOWED' }),
+      })),
+      {
+        name: 'nested argument alias',
+        run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { request: { endpoint: 'state' } } }))
+          .rejects.toMatchObject({ code: 'INVALID_MESSAGE' }),
+      },
+      {
+        name: 'invalid scalar body',
+        run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint: 'state', payload: 'state' } } }))
+          .rejects.toMatchObject({ code: 'INVALID_MESSAGE' }),
+      },
+      {
+        name: 'feed through unary call',
+        run: async () => await expect(bridge.call({ endpoint: 'dsBot/feed', payload: { args: {} } }))
+          .rejects.toMatchObject({ code: 'METHOD_NOT_ALLOWED' }),
+      },
+      {
+        name: 'call through stream',
+        run: async () => await expect(bridge.openStream({ streamId: 'dsbot-call', endpoint: 'dsBot/call', payload: { args: { endpoint: 'state' } } }))
+          .rejects.toMatchObject({ code: 'METHOD_NOT_ALLOWED' }),
+      },
+    ])
+
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('opens dsBot/feed only as an argument-free stream', async () => {
+    const open = vi.fn(async () => (async function* () {
+      yield { event: 'hello', data: { boot: 'host-1', seq: 0 } }
+    })())
+    const publish = vi.fn(async () => undefined)
+    const bridge = new HarnessRemoteBridge(gateway({ open }), publish)
+
+    await expect(bridge.openStream({ streamId: 'dsbot-feed', endpoint: 'dsBot/feed', payload: { args: {} } }))
+      .resolves.toEqual({ opened: true, streamId: 'dsbot-feed' })
+    expect(open).toHaveBeenCalledWith('dsBot/feed', { args: {} }, expect.any(AbortSignal))
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith('harness.remote.frame', {
+      streamId: 'dsbot-feed',
+      hasValue: true,
+      value: { event: 'hello', data: { boot: 'host-1', seq: 0 } },
+    }))
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith('harness.remote.stream.closed', {
+      streamId: 'dsbot-feed', reason: 'completed',
+    }))
+
+    await expect(bridge.openStream({ streamId: 'dsbot-feed-extra', endpoint: 'dsBot/feed', payload: { args: { endpoint: 'state' } } }))
+      .rejects.toMatchObject({ code: 'INVALID_MESSAGE' })
+    expect(open).toHaveBeenCalledTimes(1)
+  })
+
   it('preserves official schedule management requests, conflicts and missing-task results', async () => {
     await runScenarios([
       { endpoint: 'schedule/history', request: { sessionId: 'session-1', id: 'task-1', limit: 20, before: 'message-1' }, value: { id: 'task-1', records: [], earlierRecordsUnavailable: false, earlierRecordsPruned: false, retention: { days: 30, records: 100 } } },

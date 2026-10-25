@@ -62,6 +62,29 @@ const streamOpenSchema = z.object({
   payload: z.unknown(),
 }).strict()
 const streamCloseSchema = z.object({ streamId: z.string().min(1).max(128) }).strict()
+const dsBotCallPayloadSchema = z.object({ args: z.object({
+  endpoint: z.string().min(1).max(128),
+  payload: z.record(z.unknown()).nullable().optional(),
+}).strict() }).strict()
+const dsBotAnswerQuestionPayloadSchema = z.object({
+  sessionId: z.string().min(1).max(256).refine(value => value.trim().length > 0),
+  questionId: z.string().min(1).max(256).refine(value => value.trim().length > 0),
+  answer: z.object({
+    selected: z.array(z.string().min(1).max(256).refine(value => value.trim().length > 0)).max(6),
+    custom: z.string().min(1).max(8_000).refine(value => value.trim().length > 0).optional(),
+  }).strict(),
+}).strict()
+const dsBotApprovalAnswerPayloadSchema = z.object({
+  id: z.string().min(1).max(256).refine(value => value.trim().length > 0),
+  choice: z.enum(['allow', 'reject']),
+}).strict()
+const dsBotDismissQuestionPayloadSchema = z.object({
+  sessionId: z.string().min(1).max(256).refine(value => value.trim().length > 0),
+}).strict()
+const dsBotRoomProgressPayloadSchema = z.object({
+  roomId: z.string().min(1).max(256).refine(value => value.trim().length > 0),
+}).strict()
+const dsBotFeedPayloadSchema = z.object({ args: z.object({}).strict() }).strict()
 const commandExecuteArgsSchema = z.object({
   agentId: z.string().min(1).max(128),
   line: z.string().min(1).max(2048),
@@ -102,8 +125,21 @@ const directoryListSchema = z.object({
 const MAX_ACTIVE_STREAMS = MAX_ALPHA_STREAMS_PER_CONNECTION
 const MAX_ACTIVE_TRANSFERS = MAX_ACTIVE_TRANSFERS_PER_DIRECTION
 const INLINE_TRANSFER_RESPONSE_BYTES = 2 * 1024 * 1024
+const DS_BOT_MOBILE_CALL_ENDPOINTS = new Set([
+  'hello',
+  'state',
+  'chat',
+  'room-chat',
+  'avatar',
+  'notices',
+  'send',
+  'answer-question',
+  'dismiss-question',
+  'approval-answer',
+  'room-progress',
+])
 
-/** Fixed v0.1.2 Typert Remote subset exposed to authenticated peers. */
+/** Fixed Typert Remote endpoints exposed to authenticated peers. */
 export const HARNESS_REMOTE_ALLOWLIST = [
   '$events',
   '$events/result',
@@ -116,6 +152,8 @@ export const HARNESS_REMOTE_ALLOWLIST = [
   'credentials/set',
   'credentials/unset',
   'directoryPicker/list',
+  'dsBot/call',
+  'dsBot/feed',
   'fileReferences/list',
   'goals/clear',
   'goals/complete',
@@ -221,6 +259,8 @@ export class HarnessRemoteBridge {
   async call(input: unknown): Promise<TypertRpcResult> {
     const params = callSchema.parse(input) as HarnessRemoteCallParams
     this.assertAllowed(params.endpoint)
+    if (params.endpoint === 'dsBot/feed') throw new RpcError('METHOD_NOT_ALLOWED', 'Use a stream for this DS Bot endpoint.')
+    if (params.endpoint === 'dsBot/call') this.assertDsBotCallPayload(params.payload)
     if (TERMINAL_STREAMS.has(params.endpoint)) throw new RpcError('METHOD_NOT_ALLOWED', 'Use a stream for this terminal endpoint.')
     if (['settings/update', 'settings/replace', 'settings/mutate'].includes(params.endpoint)) {
       const args = requestArgs(params.payload)
@@ -411,6 +451,8 @@ export class HarnessRemoteBridge {
   async openStream(input: unknown): Promise<{ opened: true; streamId: string }> {
     const params = streamOpenSchema.parse(input) as HarnessRemoteStreamOpenParams
     this.assertAllowed(params.endpoint)
+    if (params.endpoint === 'dsBot/call') throw new RpcError('METHOD_NOT_ALLOWED', 'This DS Bot endpoint is unary.')
+    if (params.endpoint === 'dsBot/feed') this.assertDsBotFeedPayload(params.payload)
     if (params.endpoint.startsWith('pluginManager/')) throw new RpcError('METHOD_NOT_ALLOWED', 'Plugin management endpoints are not streams.')
     if (params.endpoint.startsWith('settings/')) throw new RpcError('METHOD_NOT_ALLOWED', 'Settings endpoints are not streams.')
     if (TERMINAL_CALLS.has(params.endpoint)) throw new RpcError('METHOD_NOT_ALLOWED', 'This terminal endpoint is not a stream.')
@@ -478,6 +520,32 @@ export class HarnessRemoteBridge {
       || (!plugin && (!Array.isArray(row.rows) || row.rows.some(value => !isRecord(value) || remoteModule(value.moduleName))
         || (Array.isArray(row.overrides) && row.overrides.some(value => remoteModule(value) || value === 'ds-harness-remote-tui'))))) {
       throw new RpcError('PERMISSION_DENIED', 'The Remote plugin can only be enabled or disabled locally on the Host.')
+    }
+  }
+
+  private assertDsBotCallPayload(payload: unknown): void {
+    const parsed = dsBotCallPayloadSchema.safeParse(payload)
+    if (!parsed.success) throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot Remote call.')
+    if (!DS_BOT_MOBILE_CALL_ENDPOINTS.has(parsed.data.args.endpoint)) {
+      throw new RpcError('METHOD_NOT_ALLOWED', 'The requested DS Bot mobile endpoint is not allowed.')
+    }
+    if (parsed.data.args.endpoint === 'answer-question' && !dsBotAnswerQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot question answer.')
+    }
+    if (parsed.data.args.endpoint === 'approval-answer' && !dsBotApprovalAnswerPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot approval answer.')
+    }
+    if (parsed.data.args.endpoint === 'dismiss-question' && !dsBotDismissQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot question dismissal.')
+    }
+    if (parsed.data.args.endpoint === 'room-progress' && !dsBotRoomProgressPayloadSchema.safeParse(parsed.data.args.payload).success) {
+      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot room progress request.')
+    }
+  }
+
+  private assertDsBotFeedPayload(payload: unknown): void {
+    if (!dsBotFeedPayloadSchema.safeParse(payload).success) {
+      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot Remote feed request.')
     }
   }
 
