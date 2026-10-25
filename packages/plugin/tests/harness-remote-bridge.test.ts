@@ -85,14 +85,28 @@ describe('HarnessRemoteBridge', () => {
     }
   })
 
-  it('forwards only the fixed DS Bot MVP call endpoints', async () => {
-    const endpoints = ['hello', 'state', 'chat', 'room-chat', 'avatar', 'notices', 'send', 'dismiss-question']
-    await runScenarios(endpoints.map(endpoint => ({
+  it('forwards fixed DS Bot conversation, status, and management operations with validated payloads', async () => {
+    const requests = [
+      ['hello', { api: [1] }], ['state', { avatars: 'ref' }], ['models', {}],
+      ['efforts', { ref: 'provider/model' }], ['earlier', { sessionId: 'session-1', cursor: { part: 0 } }],
+      ['exchange', { a: 'session-1', b: 'session-2' }], ['usage', {}], ['run-stats', { botId: 'bot-1' }],
+      ['schedules', { botId: 'bot-1' }], ['chat', { botId: 'bot-1' }], ['room-chat', { roomId: 'room-1' }],
+      ['avatar', { botId: 'bot-1' }], ['notices', { since: 0 }], ['send', { sessionId: 'session-1', text: 'Hello' }],
+      ['create-bot', { name: 'Helper', model: null }], ['duplicate-bot', { id: 'bot-1' }],
+      ['update-bot', { id: 'bot-1', name: 'Helper' }], ['delete-bot', { id: 'bot-1' }],
+      ['set-main', { id: 'bot-1', main: true }], ['set-flags', { id: 'bot-1', pinned: true }],
+      ['create-room', { name: 'Team', members: ['bot-1', 'bot-2'] }],
+      ['update-room', { id: 'room-1', members: ['bot-1', 'bot-2'] }], ['delete-room', { id: 'room-1' }],
+      ['stop-member-work', { roomId: 'room-1', botId: 'bot-1' }],
+      ['view-reply', { sessionId: 'session-1', viewId: 'view-1', action: 'submit', values: {} }],
+      ['dismiss-question', { sessionId: 'session-1' }],
+    ] as const
+    await runScenarios(requests.map(([endpoint, innerPayload]) => ({
       name: endpoint,
       run: async () => {
         const dispatch = vi.fn(async () => ({ ok: true as const, value: { endpoint } }))
         const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
-        const payload = { args: { endpoint, payload: { sessionId: 'session-1' } } }
+        const payload = { args: { endpoint, payload: innerPayload } }
         await expect(bridge.call({ endpoint: 'dsBot/call', payload })).resolves.toEqual({ ok: true, value: { endpoint } })
         expect(dispatch).toHaveBeenCalledWith('dsBot/call', payload, expect.any(AbortSignal))
         expect(dispatch).toHaveBeenCalledTimes(1)
@@ -156,6 +170,31 @@ describe('HarnessRemoteBridge', () => {
     await runScenarios(invalid.map(({ name, endpoint, payload }) => ({
       name,
       run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint, payload } } }))
+        .rejects.toMatchObject({ code: 'INVALID_MESSAGE' }),
+    })))
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('rejects malformed Bot management and stop requests before Gateway dispatch', async () => {
+    const dispatch = vi.fn(async () => ({ ok: true as const }))
+    const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+    const invalid = [
+      ['create-bot', { name: ' ' }],
+      ['update-bot', { id: 'bot-1', extra: 'not accepted' }],
+      ['delete-room', { roomId: 'room-1' }],
+      ['set-main', { id: 'bot-1', main: 'yes' }],
+      ['set-flags', { id: 'bot-1', pinned: 1 }],
+      ['create-room', { name: 'Too small', members: ['bot-1'] }],
+      ['update-room', { id: 'room-1', remove: 'bot-1' }],
+      ['stop-member-work', { roomId: 'room-1' }],
+      ['send', { sessionId: 'session-1', text: '   ' }],
+      ['view-reply', { sessionId: 'session-1', viewId: 'view-1', action: 'submit', extra: true }],
+      ['state', { sessionId: 'not-a-state-field' }],
+    ] as const
+
+    await runScenarios(invalid.map(([endpoint, innerPayload]) => ({
+      name: `${endpoint} invalid payload`,
+      run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint, payload: innerPayload } } }))
         .rejects.toMatchObject({ code: 'INVALID_MESSAGE' }),
     })))
     expect(dispatch).not.toHaveBeenCalled()

@@ -84,6 +84,109 @@ const dsBotDismissQuestionPayloadSchema = z.object({
 const dsBotRoomProgressPayloadSchema = z.object({
   roomId: z.string().min(1).max(256).refine(value => value.trim().length > 0),
 }).strict()
+const dsBotIdSchema = z.string().min(1).max(256).refine(value => value.trim().length > 0)
+const dsBotOptionalTextSchema = z.string().max(12_000)
+const dsBotMemberIdsSchema = z.array(dsBotIdSchema).max(64)
+const dsBotCreateBotPayloadSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  role: z.string().max(4_000).optional(),
+  color: z.string().max(64).optional(),
+  instructions: dsBotOptionalTextSchema.optional(),
+  brief: z.string().max(4_000).optional(),
+  model: z.string().max(256).nullable().optional(),
+  effort: z.string().max(128).optional(),
+  workDir: z.string().max(4_096).optional(),
+}).strict()
+const dsBotUpdateBotPayloadSchema = z.object({
+  id: dsBotIdSchema,
+  name: z.string().trim().min(1).max(200).optional(),
+  role: z.string().max(4_000).optional(),
+  color: z.string().max(64).optional(),
+  instructions: dsBotOptionalTextSchema.optional(),
+  brief: z.string().max(4_000).optional(),
+  model: z.string().max(256).nullable().optional(),
+  effort: z.string().max(128).optional(),
+  workDir: z.string().max(4_096).optional(),
+}).strict()
+const dsBotCreateRoomPayloadSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  members: dsBotMemberIdsSchema.min(2),
+  admin: dsBotIdSchema.optional(),
+  greet: z.boolean().optional(),
+}).strict()
+const dsBotUpdateRoomPayloadSchema = z.object({
+  id: dsBotIdSchema,
+  name: z.string().trim().min(1).max(200).optional(),
+  notice: z.string().max(12_000).optional(),
+  mode: z.string().max(64).optional(),
+  admin: dsBotIdSchema.optional(),
+  members: dsBotMemberIdsSchema.optional(),
+  add: dsBotMemberIdsSchema.optional(),
+  remove: dsBotMemberIdsSchema.optional(),
+  workDir: z.string().max(4_096).optional(),
+  permission: z.string().max(128).optional(),
+  relayLimit: z.number().int().min(0).max(100).optional(),
+}).strict()
+const dsBotDeletePayloadSchema = z.object({ id: dsBotIdSchema }).strict()
+const dsBotSetMainPayloadSchema = z.object({
+  id: dsBotIdSchema,
+  main: z.boolean().optional(),
+  primary: z.boolean().optional(),
+  replace: dsBotIdSchema.optional(),
+}).strict()
+const dsBotSetFlagsPayloadSchema = z.object({
+  id: dsBotIdSchema,
+  pinned: z.boolean().optional(),
+  archived: z.boolean().optional(),
+  hidden: z.boolean().optional(),
+}).strict()
+const dsBotStopMemberPayloadSchema = z.object({ roomId: dsBotIdSchema, botId: dsBotIdSchema }).strict()
+const dsBotDuplicatePayloadSchema = z.object({ id: dsBotIdSchema }).strict()
+const dsBotSendPayloadSchema = z.object({
+  sessionId: dsBotIdSchema,
+  text: z.string().trim().min(1).max(32_000),
+}).strict()
+const dsBotViewReplyPayloadSchema = z.object({
+  sessionId: dsBotIdSchema,
+  viewId: dsBotIdSchema,
+  action: z.string().min(1).max(128),
+  values: z.record(z.unknown()).optional(),
+}).strict()
+const dsBotSimpleReadPayloadSchemas: Record<string, z.ZodTypeAny> = {
+  hello: z.object({ api: z.array(z.number().int().min(1).max(64)).max(16).optional() }).strict(),
+  state: z.object({
+    locale: z.string().max(64).optional(), since: z.number().int().nonnegative().optional(),
+    models: z.string().max(16_384).optional(), avatars: z.enum(['ref']).optional(),
+  }).strict(),
+  notices: z.object({ boot: z.string().max(256).optional(), since: z.number().int().nonnegative().optional() }).strict(),
+  avatar: z.object({ botId: dsBotIdSchema }).strict(),
+  chat: z.object({ botId: dsBotIdSchema, cursor: z.object({ part: z.number().int().nonnegative().optional(), beforeSeq: z.number().int().nonnegative().optional() }).strict().optional() }).strict(),
+  'room-chat': z.object({ roomId: dsBotIdSchema, cursor: z.object({ beforeSeq: z.number().int().nonnegative() }).strict().optional() }).strict(),
+  'room-progress': dsBotRoomProgressPayloadSchema,
+  'usage-summary': z.object({ botId: dsBotIdSchema, timeZone: z.string().max(64).optional() }).strict(),
+  'run-stats': z.object({ botId: dsBotIdSchema }).strict(),
+  models: z.object({}).strict(),
+  efforts: z.object({ ref: z.string().max(256) }).strict(),
+  earlier: z.object({ sessionId: dsBotIdSchema, cursor: z.object({ part: z.number().int().nonnegative().optional(), beforeSeq: z.number().int().nonnegative().optional() }).strict().optional() }).strict(),
+  exchange: z.object({ a: dsBotIdSchema, b: dsBotIdSchema }).strict(),
+  usage: z.object({ timeZone: z.string().max(64).optional() }).strict(),
+  schedules: z.object({ botId: dsBotIdSchema.optional(), roomId: dsBotIdSchema.optional() }).strict(),
+  'create-bot': dsBotCreateBotPayloadSchema,
+  'duplicate-bot': dsBotDuplicatePayloadSchema,
+  'update-bot': dsBotUpdateBotPayloadSchema,
+  'delete-bot': dsBotDeletePayloadSchema,
+  'set-main': dsBotSetMainPayloadSchema,
+  'set-flags': dsBotSetFlagsPayloadSchema,
+  'create-room': dsBotCreateRoomPayloadSchema,
+  'update-room': dsBotUpdateRoomPayloadSchema,
+  'delete-room': dsBotDeletePayloadSchema,
+  'stop-member-work': dsBotStopMemberPayloadSchema,
+  send: dsBotSendPayloadSchema,
+  'view-reply': dsBotViewReplyPayloadSchema,
+  'answer-question': dsBotAnswerQuestionPayloadSchema,
+  'dismiss-question': dsBotDismissQuestionPayloadSchema,
+  'approval-answer': dsBotApprovalAnswerPayloadSchema,
+}
 const dsBotFeedPayloadSchema = z.object({ args: z.object({}).strict() }).strict()
 const commandExecuteArgsSchema = z.object({
   agentId: z.string().min(1).max(128),
@@ -128,11 +231,29 @@ const INLINE_TRANSFER_RESPONSE_BYTES = 2 * 1024 * 1024
 const DS_BOT_MOBILE_CALL_ENDPOINTS = new Set([
   'hello',
   'state',
+  'models',
+  'efforts',
+  'earlier',
+  'exchange',
+  'usage',
+  'run-stats',
+  'schedules',
   'chat',
   'room-chat',
   'avatar',
   'notices',
   'send',
+  'create-bot',
+  'duplicate-bot',
+  'update-bot',
+  'delete-bot',
+  'set-main',
+  'set-flags',
+  'create-room',
+  'update-room',
+  'delete-room',
+  'stop-member-work',
+  'view-reply',
   'answer-question',
   'dismiss-question',
   'approval-answer',
@@ -529,17 +650,9 @@ export class HarnessRemoteBridge {
     if (!DS_BOT_MOBILE_CALL_ENDPOINTS.has(parsed.data.args.endpoint)) {
       throw new RpcError('METHOD_NOT_ALLOWED', 'The requested DS Bot mobile endpoint is not allowed.')
     }
-    if (parsed.data.args.endpoint === 'answer-question' && !dsBotAnswerQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot question answer.')
-    }
-    if (parsed.data.args.endpoint === 'approval-answer' && !dsBotApprovalAnswerPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot approval answer.')
-    }
-    if (parsed.data.args.endpoint === 'dismiss-question' && !dsBotDismissQuestionPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot question dismissal.')
-    }
-    if (parsed.data.args.endpoint === 'room-progress' && !dsBotRoomProgressPayloadSchema.safeParse(parsed.data.args.payload).success) {
-      throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot room progress request.')
+    const schema = dsBotSimpleReadPayloadSchemas[parsed.data.args.endpoint]
+    if (schema === undefined || !schema.safeParse(parsed.data.args.payload ?? {}).success) {
+      throw new RpcError('INVALID_MESSAGE', `Invalid DS Bot ${parsed.data.args.endpoint} request.`)
     }
   }
 
