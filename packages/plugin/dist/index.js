@@ -41008,6 +41008,7 @@ function concatChunks3(chunks, totalBytes) {
 }
 
 // src/harness-remote-bridge.ts
+import { createHash as createHash3 } from "node:crypto";
 var endpointSchema = external_exports.string().min(1).max(128).regex(/^(?:\$events(?:\/result)?|[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+)$/);
 var callSchema4 = external_exports.object({ endpoint: endpointSchema, payload: external_exports.unknown() }).strict();
 var streamOpenSchema4 = external_exports.object({
@@ -41096,10 +41097,26 @@ var dsBotSetFlagsPayloadSchema = external_exports.object({
 }).strict();
 var dsBotStopMemberPayloadSchema = external_exports.object({ roomId: dsBotIdSchema, botId: dsBotIdSchema }).strict();
 var dsBotDuplicatePayloadSchema = external_exports.object({ id: dsBotIdSchema }).strict();
+var DS_BOT_INLINE_IMAGE_BYTES = 120 * 1024;
+var DS_BOT_INLINE_IMAGES_BYTES = 4 * 1024 * 1024;
+var DS_BOT_SEND_IMAGES = 4;
+var DS_BOT_SEND_IDEMPOTENCY_ENTRIES = 128;
+var DS_BOT_SEND_IDEMPOTENCY_TTL_MS = 5 * 6e4;
+var dsBotImageSchema = external_exports.object({
+  mime: external_exports.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+  data: external_exports.string().min(4).max(Math.ceil(DS_BOT_INLINE_IMAGE_BYTES / 3) * 4)
+}).strict();
+var dsBotFileReferenceSchema = external_exports.union([
+  external_exports.object({ transferId: external_exports.string().uuid(), name: external_exports.string().min(1).max(220), mime: external_exports.string().min(1).max(128) }).strict(),
+  external_exports.object({ uploadId: external_exports.string().uuid(), name: external_exports.string().min(1).max(220), mime: external_exports.string().min(1).max(128) }).strict()
+]);
 var dsBotSendPayloadSchema = external_exports.object({
   sessionId: dsBotIdSchema,
-  text: external_exports.string().trim().min(1).max(32e3)
-}).strict();
+  text: external_exports.string().max(32e3),
+  images: external_exports.array(dsBotImageSchema).max(DS_BOT_SEND_IMAGES).optional(),
+  file: dsBotFileReferenceSchema.optional(),
+  opId: external_exports.string().uuid().optional()
+}).strict().refine((value) => value.text.trim().length > 0 || (value.images?.length ?? 0) > 0 || value.file !== void 0);
 var dsBotViewReplyPayloadSchema = external_exports.object({
   sessionId: dsBotIdSchema,
   viewId: dsBotIdSchema,
@@ -41322,8 +41339,21 @@ var HarnessRemoteBridge = class {
   streams = /* @__PURE__ */ new Map();
   incomingTransfers = /* @__PURE__ */ new Map();
   outgoingTransfers = /* @__PURE__ */ new Map();
+  dsBotSendIdempotency = /* @__PURE__ */ new Map();
   terminalCarrier;
   async call(input3) {
+    const params = callSchema4.parse(input3);
+    if (params.endpoint === "dsBot/call") {
+      const dsBotCall = dsBotCallPayloadSchema.safeParse(params.payload);
+      if (dsBotCall.success && dsBotCall.data.args.endpoint === "send") {
+        this.assertDsBotCallPayload(params.payload);
+        const send = dsBotSendPayloadSchema.parse(dsBotCall.data.args.payload ?? {});
+        if (send.opId !== void 0) return this.callIdempotent(send.opId, () => this.callCore(input3));
+      }
+    }
+    return this.callCore(input3);
+  }
+  async callCore(input3) {
     const params = callSchema4.parse(input3);
     this.assertAllowed(params.endpoint);
     if (params.endpoint === "dsBot/feed") throw new RpcError("METHOD_NOT_ALLOWED", "Use a stream for this DS Bot endpoint.");
@@ -41390,6 +41420,37 @@ var HarnessRemoteBridge = class {
       });
       throw error;
     }
+  }
+  async callIdempotent(opId, execute) {
+    const now = Date.now();
+    for (const [key, entry2] of this.dsBotSendIdempotency) {
+      if (entry2.expiresAt <= now) this.dsBotSendIdempotency.delete(key);
+    }
+    const existing = this.dsBotSendIdempotency.get(opId);
+    if (existing !== void 0) {
+      this.dsBotSendIdempotency.delete(opId);
+      this.dsBotSendIdempotency.set(opId, existing);
+      if (existing.result !== void 0) return existing.result;
+      if (existing.pending !== void 0) return existing.pending;
+    }
+    const entry = { expiresAt: now + DS_BOT_SEND_IDEMPOTENCY_TTL_MS };
+    const pending = execute().then((result) => {
+      entry.result = result;
+      entry.pending = void 0;
+      entry.expiresAt = Date.now() + DS_BOT_SEND_IDEMPOTENCY_TTL_MS;
+      return result;
+    }, (error) => {
+      if (this.dsBotSendIdempotency.get(opId) === entry) this.dsBotSendIdempotency.delete(opId);
+      throw error;
+    });
+    entry.pending = pending;
+    this.dsBotSendIdempotency.set(opId, entry);
+    while (this.dsBotSendIdempotency.size > DS_BOT_SEND_IDEMPOTENCY_ENTRIES) {
+      const oldest = this.dsBotSendIdempotency.keys().next().value;
+      if (oldest === void 0) break;
+      this.dsBotSendIdempotency.delete(oldest);
+    }
+    return pending;
   }
   async directoryList(payload, signal) {
     const args = requestArgs(payload);
@@ -41567,8 +41628,24 @@ var HarnessRemoteBridge = class {
       throw new RpcError("METHOD_NOT_ALLOWED", "The requested DS Bot mobile endpoint is not allowed.");
     }
     const schema = dsBotSimpleReadPayloadSchemas[parsed.data.args.endpoint];
-    if (schema === void 0 || !schema.safeParse(parsed.data.args.payload ?? {}).success) {
+    const innerPayload = parsed.data.args.payload ?? {};
+    const validated = schema?.safeParse(innerPayload);
+    if (schema === void 0 || validated === void 0 || !validated.success) {
       throw new RpcError("INVALID_MESSAGE", `Invalid DS Bot ${parsed.data.args.endpoint} request.`);
+    }
+    if (parsed.data.args.endpoint === "send") {
+      const send = validated.data;
+      let totalBytes = 0;
+      const images = (send.images ?? []).map((image) => {
+        const bytes = Buffer.from(image.data, "base64");
+        if (bytes.byteLength === 0 || bytes.byteLength > DS_BOT_INLINE_IMAGE_BYTES || bytes.toString("base64") !== image.data) {
+          throw new RpcError("INVALID_MESSAGE", "Invalid DS Bot inline image.");
+        }
+        totalBytes += bytes.byteLength;
+        return { mime: image.mime, size: bytes.byteLength, sha: createHash3("sha256").update(bytes).digest("hex") };
+      });
+      if (totalBytes > DS_BOT_INLINE_IMAGES_BYTES) throw new RpcError("INVALID_MESSAGE", "DS Bot inline images exceed the combined size limit.");
+      if (images.length > 0) this.logger?.debug("DS Bot inline images validated", { images });
     }
   }
   assertDsBotFeedPayload(payload) {
