@@ -6,6 +6,7 @@ import { join, parse } from 'node:path'
 import { HarnessRemoteBridge } from '../src/harness-remote-bridge.js'
 import { CodexWorkspaceBridge, type RemoteTerminalProcess, type RemoteTerminalSpawner } from '../src/codex-workspace-bridge.js'
 import { TerminalPolicy } from '../src/terminal-policy.js'
+import { PluginRouteStreamBridge } from '../src/plugin-route-bridge.js'
 import { RpcError } from '../src/rpc-router.js'
 import type { LocalTypertGateway } from '../src/typert-gateway-contract.js'
 import { MAX_SECURE_MESSAGE_BYTES } from '@dsh-remote/protocol'
@@ -801,3 +802,58 @@ function gateway(overrides: Partial<LocalTypertGateway> = {}): LocalTypertGatewa
     ...overrides,
   }
 }
+
+describe('HarnessRemoteBridge DS Bot feed carrier', () => {
+  it('routes dsBot/feed through the local plugin stream and never the Gateway', async () => {
+    const encoder = new TextEncoder()
+    const gatewayOpen = vi.fn(async () => (async function* () { throw new RpcError('METHOD_NOT_ALLOWED', 'The Gateway has no dsBot provider.') })())
+    const stream = new PluginRouteStreamBridge(vi.fn(async () => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('event: hello\ndata: {"revision":743}\n\n'))
+          controller.enqueue(encoder.encode('event: stream\ndata: {"botId":"b1","sessionId":"s1","attemptId":"a1","phase":"start"}\n\n'))
+          controller.enqueue(encoder.encode('event: stream\ndata: {"botId":"b1","attemptId":"a1","text":"hi"}\n\n'))
+          controller.close()
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    )))
+    const publish = vi.fn(async () => undefined)
+    const bridge = new HarnessRemoteBridge(
+      gateway({ open: gatewayOpen }),
+      publish,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      stream,
+    )
+
+    await expect(bridge.openStream({ streamId: 'dsbot-feed', endpoint: 'dsBot/feed', payload: { args: {} } }))
+      .resolves.toEqual({ opened: true, streamId: 'dsbot-feed' })
+    expect(gatewayOpen).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith('harness.remote.frame', {
+      streamId: 'dsbot-feed',
+      hasValue: true,
+      value: { event: 'hello', data: { revision: 743 } },
+    }))
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith('harness.remote.frame', {
+      streamId: 'dsbot-feed',
+      hasValue: true,
+      value: { event: 'stream', data: { botId: 'b1', attemptId: 'a1', text: 'hi' } },
+    }))
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith('harness.remote.stream.closed', {
+      streamId: 'dsbot-feed', reason: 'completed',
+    }))
+  })
+
+  it('keeps the Gateway feed fallback for Hosts that register a dsBot provider', async () => {
+    const open = vi.fn(async () => (async function* () {
+      yield { event: 'hello', data: { revision: 1 } }
+    })())
+    const bridge = new HarnessRemoteBridge(gateway({ open }), vi.fn(async () => undefined))
+    await expect(bridge.openStream({ streamId: 'dsbot-feed-gateway', endpoint: 'dsBot/feed', payload: { args: {} } }))
+      .resolves.toEqual({ opened: true, streamId: 'dsbot-feed-gateway' })
+    expect(open).toHaveBeenCalledWith('dsBot/feed', { args: {} }, expect.any(AbortSignal))
+  })
+})

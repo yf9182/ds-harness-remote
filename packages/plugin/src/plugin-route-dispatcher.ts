@@ -1,4 +1,5 @@
-import type { PluginRouteDispatcher } from './plugin-route-bridge.js'
+import { RpcError } from './safe-error.js'
+import type { PluginRouteDispatcher, PluginRouteStreamDispatcher } from './plugin-route-bridge.js'
 
 export interface PluginRouteConnectionLike {
   createSharedFetchHandler?(channel: '/api'): { fetch(request: Request, peer?: unknown): Promise<Response> }
@@ -61,4 +62,56 @@ function withSignal<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
     if (signal.aborted) onAbort()
     void pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
   })
+}
+
+/**
+ * Opens one allowlisted local plugin event stream (`GET api/bot/feed`) through
+ * the same authenticated carrier as `createPluginRouteDispatcher`. Streams
+ * cannot go through the official Gateway because DS Bot registers the feed as
+ * a local Fetch route rather than a Typert Remote method.
+ */
+export function createPluginRouteStreamDispatcher(
+  readConnection: () => PluginRouteConnectionLike | undefined,
+  readPort: () => number | undefined,
+  peer?: unknown,
+): PluginRouteStreamDispatcher {
+  let cookie: string | undefined
+  return async (route, signal) => {
+    signal.throwIfAborted()
+    const connection = readConnection()
+    const handler = connection?.createSharedFetchHandler?.('/api')
+    if (handler !== undefined) {
+      return handler.fetch(new Request(`http://127.0.0.1/${route}`, {
+        method: 'GET',
+        headers: { accept: 'text/event-stream' },
+        signal,
+      }), peer)
+    }
+    const port = readPort()
+    if (connection?.authenticatedUrl === undefined || typeof port !== 'number') {
+      throw new RpcError('FEATURE_NOT_SUPPORTED', 'The local plugin route carrier is unavailable.')
+    }
+    const origin = `http://127.0.0.1:${port}`
+    const open = async (): Promise<Response> => fetch(`${origin}/${route}`, {
+      method: 'GET',
+      headers: { accept: 'text/event-stream', ...(cookie === undefined ? {} : { cookie }) },
+      signal,
+      redirect: 'manual',
+    })
+    if (cookie === undefined) {
+      const launch = await fetch(connection.authenticatedUrl(`${origin}/`), { redirect: 'manual', signal })
+      const setCookie = typeof launch.headers.getSetCookie === 'function' ? launch.headers.getSetCookie() : []
+      cookie = setCookie.map(item => item.split(';', 1)[0]).join('; ') || undefined
+    }
+    let response = await open()
+    if (response.status === 401) {
+      await response.body?.cancel().catch(() => undefined)
+      cookie = undefined
+      const launch = await fetch(connection.authenticatedUrl(`${origin}/`), { redirect: 'manual', signal })
+      const setCookie = typeof launch.headers.getSetCookie === 'function' ? launch.headers.getSetCookie() : []
+      cookie = setCookie.map(item => item.split(';', 1)[0]).join('; ') || undefined
+      response = await open()
+    }
+    return response
+  }
 }

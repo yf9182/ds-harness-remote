@@ -24,7 +24,7 @@ import type { TypertGatewayLike } from './typert-gateway-contract.js'
 import { subprocessTerminalSpawner, type HostSubprocessLike } from './codex-workspace-bridge.js'
 import { TypertGatewaySwitch } from './typert-gateway-switch.js'
 import type { FileViewerHostServiceLike } from './file-viewer-bridge.js'
-import { createPluginRouteDispatcher, type PluginRouteConnectionLike } from './plugin-route-dispatcher.js'
+import { createPluginRouteDispatcher, createPluginRouteStreamDispatcher, type PluginRouteConnectionLike } from './plugin-route-dispatcher.js'
 import {
   installTuiRemoteCommand,
   type TuiRemoteBinding,
@@ -241,6 +241,11 @@ async function activate(
       () => ctx.get('fileViewerHost') as FileViewerHostServiceLike | undefined,
       subprocess === undefined ? undefined : subprocessTerminalSpawner(subprocess),
       peer => createPluginRouteDispatcher(
+        () => ctx.get('connection') as PluginRouteConnectionLike | undefined,
+        () => (ctx.get('webServer') as DshWebServerPortLike | undefined)?.port,
+        peer,
+      ),
+      peer => createPluginRouteStreamDispatcher(
         () => ctx.get('connection') as PluginRouteConnectionLike | undefined,
         () => (ctx.get('webServer') as DshWebServerPortLike | undefined)?.port,
         peer,
@@ -520,6 +525,8 @@ export { PluginControlRuntime } from './control-runtime.js'
 export { ClientSecureTransport } from './client-secure-transport.js'
 export { HARNESS_API_ALLOWLIST, HarnessApiBridge } from './harness-api-bridge.js'
 export { HARNESS_REMOTE_ALLOWLIST, HarnessRemoteBridge } from './harness-remote-bridge.js'
+export { PLUGIN_ROUTE_ALLOWLIST, PLUGIN_ROUTE_STREAM_ALLOWLIST, PluginRouteBridge, PluginRouteStreamBridge } from './plugin-route-bridge.js'
+export type { PluginRouteDispatcher, PluginRouteStreamDispatcher, SseEvent } from './plugin-route-bridge.js'
 export { RemoteHarnessApiProxy } from './remote-api-proxy.js'
 export { RemoteTypertGateway } from './remote-typert-gateway.js'
 export { RemoteFileViewerBridge } from './file-viewer-bridge.js'

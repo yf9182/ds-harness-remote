@@ -30,6 +30,7 @@ import { ensureHostWorkspaceDirectory, listRemoteDirectory } from './remote-dire
 import { RpcError } from './rpc-router.js'
 import type { LocalTypertGateway, TypertRpcResult } from './typert-gateway-contract.js'
 import { CodexWorkspaceBridge } from './codex-workspace-bridge.js'
+import type { PluginRouteStreamBridge } from './plugin-route-bridge.js'
 
 type PublishRemoteFrame = (
   event: 'harness.remote.frame' | 'harness.remote.stream.closed',
@@ -397,6 +398,8 @@ export class HarnessRemoteBridge {
     private readonly harnessVersion?: string,
     private readonly terminal = new TerminalPolicy(() => false, "", new Map()),
     private readonly codexWorkspace?: CodexWorkspaceBridge,
+    /** Local DS Bot event-stream carrier; `dsBot/feed` has no Gateway provider. */
+    private readonly pluginRouteStream?: PluginRouteStreamBridge,
   ) {
     this.terminalCarrier = usesDuplexTerminal(harnessVersion) ? new TerminalCarrierCompat(gateway) : undefined
   }
@@ -656,7 +659,14 @@ export class HarnessRemoteBridge {
     this.streams.set(params.streamId, { controller })
     let source: AsyncIterable<unknown>
     try {
-      source = (this.codexWorkspace === undefined ? undefined : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal))
+      // DS Bot exposes its live feed as the local Fetch route `GET api/bot/feed`
+      // and registers no `dsBot` Typert Remote provider, so the official Gateway
+      // cannot open `dsBot/feed`. Route it through the bounded plugin carrier and
+      // keep the Gateway path as the fallback for Hosts that do register one.
+      source = (this.pluginRouteStream !== undefined && params.endpoint === 'dsBot/feed'
+        ? await this.pluginRouteStream.open({ route: 'api/bot/feed' }, controller.signal)
+        : undefined)
+        ?? (this.codexWorkspace === undefined ? undefined : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal))
         ?? await (params.endpoint === 'terminal/follow' && this.terminalCarrier !== undefined
           ? this.terminalCarrier.open(params.payload, controller.signal)
           : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, params.payload, this.harnessVersion), controller.signal))

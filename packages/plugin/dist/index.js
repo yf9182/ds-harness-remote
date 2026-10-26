@@ -23075,6 +23075,138 @@ var PluginRouteBridge = class {
 function serializedBytes(value) {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
+var PLUGIN_ROUTE_STREAM_ALLOWLIST = ["api/bot/feed"];
+var streamSchema = external_exports.object({ route: external_exports.enum(PLUGIN_ROUTE_STREAM_ALLOWLIST) }).strict();
+var MAX_SSE_EVENT_BYTES = 512 * 1024;
+var PLUGIN_STREAM_OPEN_TIMEOUT_MS = 15e3;
+var SSE_BOUNDARIES = ["\r\n\r\n", "\n\n", "\r\r"];
+var PluginRouteStreamBridge = class {
+  constructor(dispatch, logger) {
+    this.dispatch = dispatch;
+    this.logger = logger;
+  }
+  async open(input3, signal) {
+    let params;
+    try {
+      params = streamSchema.parse(input3);
+    } catch (error) {
+      if (error instanceof external_exports.ZodError) throw new RpcError("INVALID_MESSAGE", "The plugin route stream is invalid for the remote channel.");
+      throw error;
+    }
+    const startedAt = performance.now();
+    const openController = new AbortController();
+    const onAbort = () => openController.abort(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    const openTimer = setTimeout(
+      () => openController.abort(new Error("The plugin route stream open timed out.")),
+      PLUGIN_STREAM_OPEN_TIMEOUT_MS
+    );
+    openTimer.unref?.();
+    let response;
+    try {
+      response = await this.dispatch(params.route, openController.signal);
+    } catch (error) {
+      this.logger?.warn("plugin route stream failed", {
+        route: params.route,
+        durationMs: Math.round(performance.now() - startedAt)
+      });
+      throw error instanceof RpcError ? error : new RpcError("INTERNAL_ERROR", "The local plugin route stream is unavailable.");
+    } finally {
+      clearTimeout(openTimer);
+      signal.removeEventListener("abort", onAbort);
+    }
+    if (response.status === 401 || response.status === 403) {
+      await cancelBody(response);
+      throw new RpcError("PERMISSION_DENIED", "The Host local plugin route refused the stream.");
+    }
+    if (response.status === 404) {
+      await cancelBody(response);
+      throw new RpcError("METHOD_NOT_ALLOWED", "The Host has no DS Bot feed route.");
+    }
+    if (response.status === 503) {
+      await cancelBody(response);
+      throw new RpcError("FEATURE_NOT_SUPPORTED", "The Host local plugin route carrier is unavailable.");
+    }
+    const contentType2 = (response.headers.get("content-type") ?? "").toLowerCase();
+    if (!response.ok || response.body === null || !contentType2.startsWith("text/event-stream")) {
+      await cancelBody(response);
+      throw new RpcError("FAILED", "The Host local plugin route did not open a DS Bot feed stream.");
+    }
+    this.logger?.debug("plugin route stream open", {
+      route: params.route,
+      durationMs: Math.round(performance.now() - startedAt)
+    });
+    return this.frames(response, signal);
+  }
+  async *frames(response, signal) {
+    const body = response.body;
+    if (body === null) throw new RpcError("FAILED", "The Host local plugin route returned no feed body.");
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    const onAbort = () => {
+      void reader.cancel().catch(() => void 0);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    let buffer = "";
+    try {
+      while (!signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        for (; ; ) {
+          const boundary = nextBoundary(buffer);
+          if (boundary === void 0) break;
+          const raw = buffer.slice(0, boundary.index);
+          buffer = buffer.slice(boundary.index + boundary.length);
+          if (raw.length > MAX_SSE_EVENT_BYTES) {
+            throw new RpcError("RESPONSE_TOO_LARGE", "A local DS Bot feed event exceeds the remote limit.");
+          }
+          const event = parseSseEvent(raw);
+          if (event !== void 0) yield event;
+        }
+        if (buffer.length > MAX_SSE_EVENT_BYTES) {
+          throw new RpcError("RESPONSE_TOO_LARGE", "A local DS Bot feed event exceeds the remote limit.");
+        }
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      await reader.cancel().catch(() => void 0);
+    }
+  }
+};
+async function cancelBody(response) {
+  await response.body?.cancel().catch(() => void 0);
+}
+function nextBoundary(buffer) {
+  let found;
+  for (const boundary of SSE_BOUNDARIES) {
+    const index = buffer.indexOf(boundary);
+    if (index < 0) continue;
+    if (found === void 0 || index < found.index) found = { index, length: boundary.length };
+  }
+  return found;
+}
+function parseSseEvent(raw) {
+  let event;
+  const dataLines = [];
+  for (const line of raw.split(/\r\n|\r|\n/u)) {
+    if (line === "" || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "data") dataLines.push(value);
+  }
+  if (dataLines.length === 0) return void 0;
+  let data2;
+  try {
+    data2 = JSON.parse(dataLines.join("\n"));
+  } catch {
+    throw new RpcError("FAILED", "The local DS Bot feed emitted a malformed event.");
+  }
+  return { event: event === void 0 || event === "" ? "message" : event, data: data2 };
+}
 
 // src/client-control.ts
 var ClientControl = class {
@@ -41326,13 +41458,14 @@ var HARNESS_REMOTE_ALLOWLIST = [
 ];
 var allowedEndpoints = new Set(HARNESS_REMOTE_ALLOWLIST);
 var HarnessRemoteBridge = class {
-  constructor(gateway, publish, logger, harnessVersion, terminal = new TerminalPolicy(() => false, "", /* @__PURE__ */ new Map()), codexWorkspace) {
+  constructor(gateway, publish, logger, harnessVersion, terminal = new TerminalPolicy(() => false, "", /* @__PURE__ */ new Map()), codexWorkspace, pluginRouteStream) {
     this.gateway = gateway;
     this.publish = publish;
     this.logger = logger;
     this.harnessVersion = harnessVersion;
     this.terminal = terminal;
     this.codexWorkspace = codexWorkspace;
+    this.pluginRouteStream = pluginRouteStream;
     this.terminalCarrier = usesDuplexTerminal(harnessVersion) ? new TerminalCarrierCompat(gateway) : void 0;
   }
   compactHistoryEnabled = false;
@@ -41575,7 +41708,7 @@ var HarnessRemoteBridge = class {
     this.streams.set(params.streamId, { controller });
     let source;
     try {
-      source = (this.codexWorkspace === void 0 ? void 0 : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal)) ?? await (params.endpoint === "terminal/follow" && this.terminalCarrier !== void 0 ? this.terminalCarrier.open(params.payload, controller.signal) : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, params.payload, this.harnessVersion), controller.signal));
+      source = (this.pluginRouteStream !== void 0 && params.endpoint === "dsBot/feed" ? await this.pluginRouteStream.open({ route: "api/bot/feed" }, controller.signal) : void 0) ?? (this.codexWorkspace === void 0 ? void 0 : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal)) ?? await (params.endpoint === "terminal/follow" && this.terminalCarrier !== void 0 ? this.terminalCarrier.open(params.payload, controller.signal) : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, params.payload, this.harnessVersion), controller.signal));
       controller.signal.throwIfAborted();
     } catch (error) {
       this.streams.delete(params.streamId);
@@ -41851,7 +41984,7 @@ var CodexWorkspaceBridge = class extends WorkspaceBridge {
 
 // src/service.ts
 var HostPluginRuntime = class {
-  constructor(config, identities, apiProxy, logger, localGateway, fileViewerHost, terminalSpawner, pluginRoutes) {
+  constructor(config, identities, apiProxy, logger, localGateway, fileViewerHost, terminalSpawner, pluginRoutes, pluginRouteStreams) {
     this.config = config;
     this.identities = identities;
     this.apiProxy = apiProxy;
@@ -41860,6 +41993,7 @@ var HostPluginRuntime = class {
     this.fileViewerHost = fileViewerHost;
     this.terminalSpawner = terminalSpawner;
     this.pluginRoutes = pluginRoutes;
+    this.pluginRouteStreams = pluginRouteStreams;
     this.terminalEnabled = config.terminal.enabled;
     this.loopbackPorts = [...config.loopback.ports];
     this.codex = new CodexRemoteDomain(config.codex, logger);
@@ -41874,6 +42008,7 @@ var HostPluginRuntime = class {
         peerGateway,
         this.harnessVersion
       );
+      const pluginStreamDispatcher = this.pluginRouteStreams?.(peerGateway?.peer);
       const harnessRemote = peerGateway?.supportsCarrier === true ? new HarnessRemoteBridge(
         peerGateway,
         (event, data2) => send(createEvent(event, data2)),
@@ -41885,7 +42020,8 @@ var HostPluginRuntime = class {
           () => this.terminalEnabled,
           this.codexWorkspaceState,
           this.terminalSpawner
-        )
+        ),
+        pluginStreamDispatcher === void 0 ? void 0 : new PluginRouteStreamBridge(pluginStreamDispatcher, this.logger)
       ) : void 0;
       const fileViewer = new RemoteFileViewerBridge(
         () => this.fileViewerHost?.(),
@@ -42250,6 +42386,7 @@ var HostPluginRuntime = class {
     }
     if (this.fileViewerHost?.() !== void 0) capabilities.push("fileviewer.read.v1");
     if (this.pluginRoutes?.() !== void 0) capabilities.push("plugin.route.v1");
+    if (this.pluginRouteStreams?.() !== void 0) capabilities.push("plugin.route.stream.v1");
     if (this.codex.isAvailable()) capabilities.push("codex.appserver.v1", "codex.appserver.transfer.v1");
     if (this.acp.enabledBackends().length > 0) {
       capabilities.push("agent.acp.v1", "agent.acp.transfer.v1", "agent.acp.workspace-files.v1");
@@ -42390,6 +42527,47 @@ function withSignal(pending, signal) {
     if (signal.aborted) onAbort();
     void pending.then(resolve6, reject).finally(() => signal.removeEventListener("abort", onAbort));
   });
+}
+function createPluginRouteStreamDispatcher(readConnection, readPort, peer) {
+  let cookie;
+  return async (route, signal) => {
+    signal.throwIfAborted();
+    const connection = readConnection();
+    const handler = connection?.createSharedFetchHandler?.("/api");
+    if (handler !== void 0) {
+      return handler.fetch(new Request(`http://127.0.0.1/${route}`, {
+        method: "GET",
+        headers: { accept: "text/event-stream" },
+        signal
+      }), peer);
+    }
+    const port = readPort();
+    if (connection?.authenticatedUrl === void 0 || typeof port !== "number") {
+      throw new RpcError("FEATURE_NOT_SUPPORTED", "The local plugin route carrier is unavailable.");
+    }
+    const origin = `http://127.0.0.1:${port}`;
+    const open3 = async () => fetch(`${origin}/${route}`, {
+      method: "GET",
+      headers: { accept: "text/event-stream", ...cookie === void 0 ? {} : { cookie } },
+      signal,
+      redirect: "manual"
+    });
+    if (cookie === void 0) {
+      const launch = await fetch(connection.authenticatedUrl(`${origin}/`), { redirect: "manual", signal });
+      const setCookie = typeof launch.headers.getSetCookie === "function" ? launch.headers.getSetCookie() : [];
+      cookie = setCookie.map((item) => item.split(";", 1)[0]).join("; ") || void 0;
+    }
+    let response = await open3();
+    if (response.status === 401) {
+      await response.body?.cancel().catch(() => void 0);
+      cookie = void 0;
+      const launch = await fetch(connection.authenticatedUrl(`${origin}/`), { redirect: "manual", signal });
+      const setCookie = typeof launch.headers.getSetCookie === "function" ? launch.headers.getSetCookie() : [];
+      cookie = setCookie.map((item) => item.split(";", 1)[0]).join("; ") || void 0;
+      response = await open3();
+    }
+    return response;
+  };
 }
 
 // src/cli.ts
@@ -43296,6 +43474,11 @@ async function activate(ctx, readConfig, entryId, tuiBinding) {
         () => ctx.get("connection"),
         () => ctx.get("webServer")?.port,
         peer
+      ),
+      (peer) => createPluginRouteStreamDispatcher(
+        () => ctx.get("connection"),
+        () => ctx.get("webServer")?.port,
+        peer
       )
     );
     let clientRuntime2;
@@ -43524,7 +43707,11 @@ export {
   HostServerConnection,
   IdentityInvalidError,
   IdentityStore,
+  PLUGIN_ROUTE_ALLOWLIST,
+  PLUGIN_ROUTE_STREAM_ALLOWLIST,
   PluginControlRuntime,
+  PluginRouteBridge,
+  PluginRouteStreamBridge,
   RemoteFileViewerBridge,
   RemoteHarnessApiProxy,
   RemoteTypertGateway2 as RemoteTypertGateway,

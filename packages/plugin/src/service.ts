@@ -30,8 +30,8 @@ import { HostServerConnection } from './server-connection.js'
 import { ServerCredentialStore } from './server-credentials.js'
 import { HarnessApiBridge, type TypertGatewayLike } from './harness-api-bridge.js'
 import { HarnessRemoteBridge } from './harness-remote-bridge.js'
-import type { PluginRouteDispatcher } from './plugin-route-bridge.js'
-import { PluginRouteBridge } from './plugin-route-bridge.js'
+import type { PluginRouteDispatcher, PluginRouteStreamDispatcher } from './plugin-route-bridge.js'
+import { PluginRouteBridge, PluginRouteStreamBridge } from './plugin-route-bridge.js'
 import type { LocalTypertGateway } from './typert-gateway-contract.js'
 import { loadNodeRtcFactory } from './werift-rtc.js'
 import type { AuthenticatedPeerChannel } from './types.js'
@@ -94,6 +94,8 @@ export class HostPluginRuntime {
     /** PTY-backed terminal provider from the Host `subprocess` service, when present. */
     private readonly terminalSpawner?: RemoteTerminalSpawner,
     private readonly pluginRoutes?: (peer?: unknown) => PluginRouteDispatcher | undefined,
+    /** Local DS Bot feed carrier: the feed route is not a Gateway Remote method. */
+    private readonly pluginRouteStreams?: (peer?: unknown) => PluginRouteStreamDispatcher | undefined,
   ) {
     this.terminalEnabled = config.terminal.enabled
     this.loopbackPorts = [...config.loopback.ports]
@@ -111,6 +113,7 @@ export class HostPluginRuntime {
             peerGateway as TypertGatewayLike | undefined,
             this.harnessVersion,
           )
+      const pluginStreamDispatcher = this.pluginRouteStreams?.(peerGateway?.peer)
       const harnessRemote = peerGateway?.supportsCarrier === true
         ? new HarnessRemoteBridge(
             peerGateway,
@@ -124,6 +127,9 @@ export class HostPluginRuntime {
               this.codexWorkspaceState,
               this.terminalSpawner,
             ),
+            pluginStreamDispatcher === undefined
+              ? undefined
+              : new PluginRouteStreamBridge(pluginStreamDispatcher, this.logger),
           )
         : undefined
       const fileViewer = new RemoteFileViewerBridge(
@@ -518,6 +524,7 @@ export class HostPluginRuntime {
     }
     if (this.fileViewerHost?.() !== undefined) capabilities.push('fileviewer.read.v1')
     if (this.pluginRoutes?.() !== undefined) capabilities.push('plugin.route.v1')
+    if (this.pluginRouteStreams?.() !== undefined) capabilities.push('plugin.route.stream.v1')
     if (this.codex.isAvailable()) capabilities.push('codex.appserver.v1', 'codex.appserver.transfer.v1')
     // Protocol support is stable during background warmup; workspaceTypes reports readiness.
     if (this.acp.enabledBackends().length > 0) {
