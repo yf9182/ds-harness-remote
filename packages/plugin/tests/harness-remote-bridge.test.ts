@@ -149,6 +149,68 @@ describe('HarnessRemoteBridge', () => {
     })))
   })
 
+  it('validates and forwards bounded DS Bot images and transfer references', async () => {
+    const dispatch = vi.fn(async () => ({ ok: true as const, value: { accepted: true } }))
+    const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+    const image = { mime: 'image/png', data: Buffer.from([0, 1, 2, 255]).toString('base64') }
+    const payload = { args: { endpoint: 'send', payload: {
+      sessionId: 'session-1', text: '', images: [image],
+      file: { transferId: '1a30db9d-e513-4f13-a1aa-ef45b0aeb4a2', name: 'diagram.png', mime: 'image/png' },
+      opId: 'f4a1e638-36c2-4a76-a163-3db0a41a6e9c',
+    } } }
+    await expect(bridge.call({ endpoint: 'dsBot/call', payload })).resolves.toEqual({ ok: true, value: { accepted: true } })
+    expect(dispatch).toHaveBeenCalledWith('dsBot/call', payload, expect.any(AbortSignal))
+  })
+
+  it('rejects non-canonical, oversized, excessive, or malformed DS Bot send media before dispatch', async () => {
+    const dispatch = vi.fn(async () => ({ ok: true as const }))
+    const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+    const valid = { sessionId: 'session-1', text: 'look', images: [{ mime: 'image/png', data: Buffer.from([1]).toString('base64') }] }
+    const invalid = [
+      { ...valid, images: [{ mime: 'image/png', data: 'AB==' }] },
+      { ...valid, images: [{ mime: 'image/png', data: Buffer.alloc(120 * 1024 + 1).toString('base64') }] },
+      { ...valid, images: Array.from({ length: 5 }, () => valid.images[0]) },
+      { ...valid, images: [{ mime: 'image/svg+xml', data: valid.images[0].data }] },
+      { ...valid, file: { transferId: 'bad-id', name: '../file', mime: 'text/plain' } },
+      { sessionId: 'session-1', text: '   ' },
+    ]
+    await runScenarios(invalid.map((payload, index) => ({
+      name: `invalid media shape ${index + 1}`,
+      run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint: 'send', payload } } }))
+        .rejects.toMatchObject({ code: 'INVALID_MESSAGE' }),
+    })))
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('deduplicates unary DS Bot sends by per-connection opId and caches only the result', async () => {
+    const dispatch = vi.fn(async () => ({ ok: true as const, value: { accepted: true } }))
+    const first = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+    const second = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
+    const opId = 'f4a1e638-36c2-4a76-a163-3db0a41a6e9c'
+    const request = (text: string) => ({ endpoint: 'dsBot/call', payload: { args: { endpoint: 'send', payload: { sessionId: 'session-1', text, opId } } } })
+
+    await expect(first.call(request('private prompt one'))).resolves.toEqual({ ok: true, value: { accepted: true } })
+    await expect(first.call(request('private prompt two'))).resolves.toEqual({ ok: true, value: { accepted: true } })
+    expect(dispatch).toHaveBeenCalledTimes(1)
+    await expect(second.call(request('private prompt one'))).resolves.toEqual({ ok: true, value: { accepted: true } })
+    expect(dispatch).toHaveBeenCalledTimes(2)
+
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    try {
+      const expiringDispatch = vi.fn(async () => ({ ok: true as const, value: true }))
+      const expiring = new HarnessRemoteBridge(gateway({ dispatch: expiringDispatch }), vi.fn())
+      const expiringRequest = { endpoint: 'dsBot/call', payload: { args: { endpoint: 'send', payload: {
+        sessionId: 'session-1', text: 'message', opId: '6b8a8f27-17e8-49f1-9870-13ad6c5b7278',
+      } } } }
+      await expiring.call(expiringRequest)
+      clock.mockReturnValue(10_000 + 5 * 60_000)
+      await expiring.call(expiringRequest)
+      expect(expiringDispatch).toHaveBeenCalledTimes(2)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('rejects malformed or expanded DS Bot question and approval payloads before dispatch', async () => {
     const dispatch = vi.fn(async () => ({ ok: true as const }))
     const bridge = new HarnessRemoteBridge(gateway({ dispatch }), vi.fn())
@@ -206,7 +268,7 @@ describe('HarnessRemoteBridge', () => {
     const bridge = new HarnessRemoteBridge(gateway({ dispatch, open }), vi.fn())
 
     await runScenarios([
-      ...['providers', 'provider-key', 'capability-approve', 'memory-edit', 'usage-summary', 'view-reply', 'unknown'].map(endpoint => ({
+      ...['providers', 'provider-key', 'capability-approve', 'memory-edit', 'usage-summary', 'unknown'].map(endpoint => ({
         name: `inner endpoint ${endpoint}`,
         run: async () => await expect(bridge.call({ endpoint: 'dsBot/call', payload: { args: { endpoint, payload: {} } } }))
           .rejects.toMatchObject({ code: 'METHOD_NOT_ALLOWED' }),

@@ -1,4 +1,5 @@
 import { compactHistory } from './compact-history.js'
+import { createHash } from 'node:crypto'
 import { TerminalCarrierCompat, usesDuplexTerminal } from './terminal-carrier-compat.js'
 import type {
   HarnessApiTransferChunkParams,
@@ -52,6 +53,12 @@ interface OutgoingTransfer {
   totalChunks: number
   nextIndex: number
   touchedAt: number
+}
+
+interface DsBotSendIdempotencyEntry {
+  expiresAt: number
+  result?: TypertRpcResult
+  pending?: Promise<TypertRpcResult>
 }
 
 const endpointSchema = z.string().min(1).max(128).regex(/^(?:\$events(?:\/result)?|[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+)$/)
@@ -142,10 +149,26 @@ const dsBotSetFlagsPayloadSchema = z.object({
 }).strict()
 const dsBotStopMemberPayloadSchema = z.object({ roomId: dsBotIdSchema, botId: dsBotIdSchema }).strict()
 const dsBotDuplicatePayloadSchema = z.object({ id: dsBotIdSchema }).strict()
+const DS_BOT_INLINE_IMAGE_BYTES = 120 * 1024
+const DS_BOT_INLINE_IMAGES_BYTES = 4 * 1024 * 1024
+const DS_BOT_SEND_IMAGES = 4
+const DS_BOT_SEND_IDEMPOTENCY_ENTRIES = 128
+const DS_BOT_SEND_IDEMPOTENCY_TTL_MS = 5 * 60_000
+const dsBotImageSchema = z.object({
+  mime: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
+  data: z.string().min(4).max(Math.ceil(DS_BOT_INLINE_IMAGE_BYTES / 3) * 4),
+}).strict()
+const dsBotFileReferenceSchema = z.union([
+  z.object({ transferId: z.string().uuid(), name: z.string().min(1).max(220), mime: z.string().min(1).max(128) }).strict(),
+  z.object({ uploadId: z.string().uuid(), name: z.string().min(1).max(220), mime: z.string().min(1).max(128) }).strict(),
+])
 const dsBotSendPayloadSchema = z.object({
   sessionId: dsBotIdSchema,
-  text: z.string().trim().min(1).max(32_000),
-}).strict()
+  text: z.string().max(32_000),
+  images: z.array(dsBotImageSchema).max(DS_BOT_SEND_IMAGES).optional(),
+  file: dsBotFileReferenceSchema.optional(),
+  opId: z.string().uuid().optional(),
+}).strict().refine(value => value.text.trim().length > 0 || (value.images?.length ?? 0) > 0 || value.file !== undefined)
 const dsBotViewReplyPayloadSchema = z.object({
   sessionId: dsBotIdSchema,
   viewId: dsBotIdSchema,
@@ -363,6 +386,7 @@ export class HarnessRemoteBridge {
   private readonly streams = new Map<string, ActiveRemoteStream>()
   private readonly incomingTransfers = new Map<string, IncomingTransfer>()
   private readonly outgoingTransfers = new Map<string, OutgoingTransfer>()
+  private readonly dsBotSendIdempotency = new Map<string, DsBotSendIdempotencyEntry>()
 
   private readonly terminalCarrier: TerminalCarrierCompat | undefined
 
@@ -378,6 +402,19 @@ export class HarnessRemoteBridge {
   }
 
   async call(input: unknown): Promise<TypertRpcResult> {
+    const params = callSchema.parse(input) as HarnessRemoteCallParams
+    if (params.endpoint === 'dsBot/call') {
+      const dsBotCall = dsBotCallPayloadSchema.safeParse(params.payload)
+      if (dsBotCall.success && dsBotCall.data.args.endpoint === 'send') {
+        this.assertDsBotCallPayload(params.payload)
+        const send = dsBotSendPayloadSchema.parse(dsBotCall.data.args.payload ?? {})
+        if (send.opId !== undefined) return this.callIdempotent(send.opId, () => this.callCore(input))
+      }
+    }
+    return this.callCore(input)
+  }
+
+  private async callCore(input: unknown): Promise<TypertRpcResult> {
     const params = callSchema.parse(input) as HarnessRemoteCallParams
     this.assertAllowed(params.endpoint)
     if (params.endpoint === 'dsBot/feed') throw new RpcError('METHOD_NOT_ALLOWED', 'Use a stream for this DS Bot endpoint.')
@@ -455,6 +492,39 @@ export class HarnessRemoteBridge {
       })
       throw error
     }
+  }
+
+  private async callIdempotent(opId: string, execute: () => Promise<TypertRpcResult>): Promise<TypertRpcResult> {
+    const now = Date.now()
+    for (const [key, entry] of this.dsBotSendIdempotency) {
+      if (entry.expiresAt <= now) this.dsBotSendIdempotency.delete(key)
+    }
+    const existing = this.dsBotSendIdempotency.get(opId)
+    if (existing !== undefined) {
+      this.dsBotSendIdempotency.delete(opId)
+      this.dsBotSendIdempotency.set(opId, existing)
+      if (existing.result !== undefined) return existing.result
+      if (existing.pending !== undefined) return existing.pending
+    }
+
+    const entry: DsBotSendIdempotencyEntry = { expiresAt: now + DS_BOT_SEND_IDEMPOTENCY_TTL_MS }
+    const pending = execute().then(result => {
+      entry.result = result
+      entry.pending = undefined
+      entry.expiresAt = Date.now() + DS_BOT_SEND_IDEMPOTENCY_TTL_MS
+      return result
+    }, error => {
+      if (this.dsBotSendIdempotency.get(opId) === entry) this.dsBotSendIdempotency.delete(opId)
+      throw error
+    })
+    entry.pending = pending
+    this.dsBotSendIdempotency.set(opId, entry)
+    while (this.dsBotSendIdempotency.size > DS_BOT_SEND_IDEMPOTENCY_ENTRIES) {
+      const oldest = this.dsBotSendIdempotency.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.dsBotSendIdempotency.delete(oldest)
+    }
+    return pending
   }
 
   private async directoryList(payload: unknown, signal: AbortSignal): Promise<TypertRpcResult> {
@@ -651,8 +721,24 @@ export class HarnessRemoteBridge {
       throw new RpcError('METHOD_NOT_ALLOWED', 'The requested DS Bot mobile endpoint is not allowed.')
     }
     const schema = dsBotSimpleReadPayloadSchemas[parsed.data.args.endpoint]
-    if (schema === undefined || !schema.safeParse(parsed.data.args.payload ?? {}).success) {
+    const innerPayload = parsed.data.args.payload ?? {}
+    const validated = schema?.safeParse(innerPayload)
+    if (schema === undefined || validated === undefined || !validated.success) {
       throw new RpcError('INVALID_MESSAGE', `Invalid DS Bot ${parsed.data.args.endpoint} request.`)
+    }
+    if (parsed.data.args.endpoint === 'send') {
+      const send = validated.data as z.infer<typeof dsBotSendPayloadSchema>
+      let totalBytes = 0
+      const images = (send.images ?? []).map(image => {
+        const bytes = Buffer.from(image.data, 'base64')
+        if (bytes.byteLength === 0 || bytes.byteLength > DS_BOT_INLINE_IMAGE_BYTES || bytes.toString('base64') !== image.data) {
+          throw new RpcError('INVALID_MESSAGE', 'Invalid DS Bot inline image.')
+        }
+        totalBytes += bytes.byteLength
+        return { mime: image.mime, size: bytes.byteLength, sha: createHash('sha256').update(bytes).digest('hex') }
+      })
+      if (totalBytes > DS_BOT_INLINE_IMAGES_BYTES) throw new RpcError('INVALID_MESSAGE', 'DS Bot inline images exceed the combined size limit.')
+      if (images.length > 0) this.logger?.debug('DS Bot inline images validated', { images })
     }
   }
 
